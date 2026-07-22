@@ -7,6 +7,5 @@
     "start": "node src/server.js"
   },
   "dependencies": {
-    "playwright": "^1.49.1"
-  }
+  "playwright": "1.61.1"  }
 }
