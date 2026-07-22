@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.49.1-jammy
+FROM mcr.microsoft.com/playwright:v1.61.1-jamm
 
 WORKDIR /app
 COPY package*.json ./
