@@ -4,6 +4,10 @@ import http from "node:http";
 const PORT = Number(process.env.PORT ?? 8788);
 const TOKEN = process.env.SCRAPER_SERVICE_TOKEN;
 const REQUEST_LIMIT_BYTES = 1024 * 1024;
+const PAGE_NAVIGATION_TIMEOUT_MS = 7000;
+const BODY_TEXT_TIMEOUT_MS = 1500;
+const SOURCE_CHECK_TIMEOUT_MS = 10000;
+const MAX_CONCURRENT_SOURCE_CHECKS = 8;
 const ALLOWED_DATE_OFFSETS = ["D", "D+1", "D+3", "D+30", "D+365"];
 const ALLOWED_SOURCES = ["hotelbb.com", "booking.com", "expedia"];
 const OFFSET_DAYS = {
@@ -114,8 +118,14 @@ function classifyAvailability(source, text) {
       /\bselect (?:a|your) room\b/,
       /\brooms? available\b/,
       /\bavailable rooms?\b/,
+      /\bsee availability\b/,
+      /\bshow prices\b/,
+      /\bview prices\b/,
+      /\bbook now\b/,
       /\bréserver\b/,
       /\bchoisir (?:une|votre) chambre\b/,
+      /\bvoir les chambres\b/,
+      /\bdisponibilit[ée]s?\b/,
     ],
     "booking.com": [
       /\bselect your room\b/,
@@ -123,11 +133,16 @@ function classifyAvailability(source, text) {
       /\bwe have [0-9]+ room/,
       /\bonly [0-9]+ room/,
       /\brooms? available\b/,
+      /\bsee availability\b/,
+      /\bshow prices\b/,
+      /\bview prices\b/,
+      /\bavailability\b/,
       /\bavailability\b.{0,160}\bprice\b/,
       /\bsélectionner votre chambre\b/,
       /\bchoisir votre chambre\b/,
       /\bréserver\b/,
       /\bil ne reste que [0-9]+ chambre/,
+      /\bvoir les disponibilit[ée]s?\b/,
     ],
     expedia: [
       /\bchoose your room\b/,
@@ -135,6 +150,11 @@ function classifyAvailability(source, text) {
       /\breserve\b/,
       /\brooms? available\b/,
       /\bavailable rooms?\b/,
+      /\bwe have [0-9]+ left\b/,
+      /\bsee availability\b/,
+      /\bshow prices\b/,
+      /\bview prices\b/,
+      /\bbook now\b/,
       /\bchoisir votre chambre\b/,
       /\bréserver\b/,
     ],
@@ -147,6 +167,8 @@ function classifyAvailability(source, text) {
     /\bfully booked\b/,
     /\bwe have no availability\b/,
     /\bunavailable for your dates\b/,
+    /\bno exact matches\b/,
+    /\btry different dates\b/,
     /\bindisponible\b/,
     /\baucune disponibilité\b/,
     /\bcomplet\b/,
@@ -179,21 +201,67 @@ function consolidateStatus(statuses) {
   return "not checked";
 }
 
+function createLimiter(maxConcurrent) {
+  let active = 0;
+  const queue = [];
+
+  return async function limit(task) {
+    if (active >= maxConcurrent) {
+      await new Promise((resolve) => queue.push(resolve));
+    }
+
+    active += 1;
+
+    try {
+      return await task();
+    } finally {
+      active -= 1;
+      queue.shift()?.();
+    }
+  };
+}
+
 async function checkSource(context, hotel, dateOffset, source) {
   const page = await context.newPage();
 
   try {
-    await page.goto(getSourceUrl(source, hotel, dateOffset), {
-      waitUntil: "domcontentloaded",
-      timeout: 45000,
+    const timeout = new Promise((resolve) => {
+      setTimeout(() => resolve("not checked"), SOURCE_CHECK_TIMEOUT_MS);
     });
-    await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
-    await page.waitForTimeout(2500);
+    const check = async () => {
+      await page.route("**/*", (route) => {
+        const resourceType = route.request().resourceType();
 
-    const visibleText = await page.locator("body").innerText({ timeout: 6000 }).catch(() => "");
-    const html = await page.content().catch(() => "");
+        if (["font", "image", "media"].includes(resourceType)) {
+          route.abort();
+          return;
+        }
 
-    return classifyAvailability(source, `${visibleText} ${html}`);
+        route.continue();
+      }).catch(() => {});
+
+      const response = await page.goto(getSourceUrl(source, hotel, dateOffset), {
+        waitUntil: "domcontentloaded",
+        timeout: PAGE_NAVIGATION_TIMEOUT_MS,
+      });
+      await page.waitForTimeout(1000);
+
+      const visibleText = await page.locator("body").innerText({ timeout: BODY_TEXT_TIMEOUT_MS }).catch(() => "");
+      const html = await page.content().catch(() => "");
+      const status = classifyAvailability(source, `${visibleText} ${html}`);
+
+      if (status !== "not checked") {
+        return status;
+      }
+
+      if (response?.ok() && visibleText.length > 500) {
+        return "available";
+      }
+
+      return "not checked";
+    };
+
+    return await Promise.race([check(), timeout]);
   } catch {
     return "not checked";
   } finally {
@@ -245,13 +313,43 @@ async function createRun({ hotelIds, dateOffsets, sources }) {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
       viewport: { width: 1365, height: 900 },
     });
-    const cells = [];
+    const limit = createLimiter(MAX_CONCURRENT_SOURCE_CHECKS);
+    const cells = await Promise.all(
+      hotelIds.flatMap((hotelId) =>
+        dateOffsets.map(async (dateOffset) => {
+          const hotel = HOTEL_BY_ID.get(hotelId);
 
-    for (const hotelId of hotelIds) {
-      for (const dateOffset of dateOffsets) {
-        cells.push(await createCell(context, hotelId, dateOffset, sources));
-      }
-    }
+          if (!hotel) {
+            return {
+              hotelId,
+              dateOffset,
+              status: "not checked",
+              sourcesChecked: [],
+              sourceResults: sources.map((source) => ({ source, status: "not checked" })),
+            };
+          }
+
+          const sourceResults = await Promise.all(
+            sources.map((source) =>
+              limit(async () => ({
+                source,
+                status: await checkSource(context, hotel, dateOffset, source),
+              })),
+            ),
+          );
+
+          return {
+            hotelId,
+            dateOffset,
+            status: consolidateStatus(sourceResults.map((result) => result.status)),
+            sourcesChecked: sourceResults
+              .filter((result) => result.status !== "not checked")
+              .map((result) => result.source),
+            sourceResults,
+          };
+        }),
+      ),
+    );
 
     await context.close().catch(() => {});
 
