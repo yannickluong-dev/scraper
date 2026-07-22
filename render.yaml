@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: bb-hotels-availability-scraper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    plan: starter
+    envVars:
+      - key: SCRAPER_SERVICE_TOKEN
+        generateValue: true
